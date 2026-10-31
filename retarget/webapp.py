@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from glb import add_animation, build_target_skeleton, detect_prefix, load_gltf, save_gltf  # noqa: E402
 from kimodo_to_mixamo import load_kimodo_npz  # noqa: E402
+from mapping import SOMA_TO_MIXAMO  # noqa: E402
+from retarget import build_pairs  # noqa: E402
 from soma import SOMA77_NAMES  # noqa: E402
 from soma_bvh import parse_bvh_to_kimodo_rows  # noqa: E402
 
@@ -81,14 +83,28 @@ async def upload_character(file: UploadFile = File(...)) -> JSONResponse:
         gltf = load_gltf(str(path))
         prefix = detect_prefix(gltf)
         sk, warns = build_target_skeleton(gltf)
+        pairs, missing = build_pairs(sk, prefix)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"could not parse GLB: {exc}") from exc
+
+    essential = ["Hips", "Spine", "Head", "LeftArm", "RightArm", "LeftUpLeg", "RightUpLeg",
+                 "LeftLeg", "RightLeg", "LeftFoot", "RightFoot", "LeftToeBase"]
+    miss_essential = [m for m in essential if any(d.endswith("-> " + m) for d in missing)]
+    parts = [f"{len(sk.names)} nodes", f"prefix '{prefix or '-'}'", f"mapped {len(pairs)}/{len(SOMA_TO_MIXAMO)}"]
+    if miss_essential:
+        parts.append("missing: " + ", ".join(miss_essential))
+        parts.append("this is usually not a Mixamo-named rig")
     report = {
         "nodes": len(sk.names),
         "prefix": prefix,
-        "warnings": warns,
-        "message": f"{len(sk.names)} skeleton nodes, animation prefix '{prefix}'",
+        "mapped": len(pairs),
+        "total": len(SOMA_TO_MIXAMO),
+        "missing": missing,
+        "missing_essential": miss_essential,
+        "warnings": warns + ([f"could not resolve {len(missing)} bones: {', '.join(missing[:8])}"] if missing else []),
+        "message": " · ".join(parts),
     }
+    report["ok"] = len(pairs) >= 10 and "Hips" not in miss_essential
     CHARS[cid] = {"name": Path(file.filename).name, "path": str(path), "prefix": prefix, "report": report}
     return JSONResponse({"id": cid, "name": Path(file.filename).name, "report": report})
 
@@ -157,9 +173,10 @@ def _run_job(job_id: str, char_id: str, motion_id: str, mode: str, limb_fix: boo
         gltf = load_gltf(char["path"])
         prefix = detect_prefix(gltf)
         sk, warns = build_target_skeleton(gltf)
+        pairs, missing = build_pairs(sk, prefix)
         for w in warns:
             _log(job, f"warn: {w}")
-        _log(job, f"prefix '{prefix}', {len(sk.names)} nodes")
+        _log(job, f"prefix '{prefix}', {len(sk.names)} nodes, mapped {len(pairs)}/{len(SOMA_TO_MIXAMO)}")
 
         motion = MOTIONS[motion_id]
         _log(job, f"motion '{motion['name']}' ({motion['kind']}), {motion['posed'].shape[0]} frames @ {motion['fps']:.0f}fps")

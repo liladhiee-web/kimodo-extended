@@ -7,6 +7,8 @@ pipelines strip it. The converter matches target nodes case-insensitively, with 
 prefix; edit TARGET_EXTRA here or provide a JSON mapping to override at runtime.
 """
 
+import re
+
 # SOMA joint name -> Mixamo node name (without prefix; prefix added/removed as needed)
 SOMA_TO_MIXAMO = {
     "Hips": "Hips",
@@ -75,3 +77,50 @@ def resolve_target_name(name: str, node_names_ci: dict[str, str], prefix: str) -
         if hit is not None:
             return hit
     return None
+
+
+# FBX/Blender dedup suffixes: "..._2", "... .001", "...:1"  (Mixamo names never end
+# with "<sep><digits>"; digit-name bones like Thumb3/Spine1 have no separator before)
+_DUP_SUFFIX_RE = re.compile(r"[:._|-]\d{1,4}$")
+
+
+def normalize_bone_name(name: str) -> str:
+    """Lowercase + strip FBX dedup suffixes, for tolerant matching."""
+    return _DUP_SUFFIX_RE.sub("", (name or "").strip().lower())
+
+
+def resolve_fuzzy(bone_name: str, names: list[str]) -> str | None:
+    """Suffix-tolerant fallback: node may be 'mixamorig_Hips', 'Bone:Hips', 'Hips.001'...
+
+    Matches when the normalized node name equals the bone name or ends with
+    '<separator><bone>', separator in : _ | - space. Prefers the shortest name.
+    """
+    base = normalize_bone_name(bone_name)
+    best = None
+    for n in names:
+        nm = normalize_bone_name(n)
+        if nm == base:
+            return n
+        for sep in (":", "_", "|", "-", " "):
+            if nm.endswith(sep + base):
+                if best is None or len(n) < len(best):
+                    best = n
+                break
+    return best
+
+
+def detect_prefix(names: list[str]) -> str:
+    """Guess the bone-name prefix from any node ending in a known bone word.
+
+    Handles ':'-style (mixamorig:Hips) AND '_'-style (mixamorig_Hips) exports.
+    """
+    for n in names:
+        if not n:
+            continue
+        low = n.lower()
+        for bone in ("hips", "spine", "head", "leftfoot"):
+            for sep in (":", "_", "|", "-", " "):
+                if low.endswith(sep + bone):
+                    i = low.rfind(sep + bone)
+                    return n[: i + 1]
+    return ""

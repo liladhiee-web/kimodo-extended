@@ -17,7 +17,7 @@ Pipeline (numpy, frame-vectorized where possible):
 from dataclasses import dataclass, field
 import numpy as np
 
-from mapping import SOMA_TO_MIXAMO, resolve_target_name  # noqa: E402
+from mapping import SOMA_TO_MIXAMO, resolve_fuzzy, resolve_target_name  # noqa: E402
 from quatmath import mat_to_quat, quat_between, quat_mul, quat_to_mat  # noqa: E402
 from soma import SOMA77_INDEX, SOMA77_NAMES, SOMA77_PARENT  # noqa: E402
 
@@ -118,6 +118,26 @@ def derive_locals(sk: TargetSkeleton, g_rot: np.ndarray, hips_positions: np.ndar
     return local
 
 
+def build_pairs(sk: "TargetSkeleton", prefix: str) -> tuple[dict[str, tuple[int, int]], list[str]]:
+    """Resolve SOMA-77 joints onto target nodes. Returns (pairs, missing_descriptions).
+
+    Resolution order per bone: exact name (with/without prefix) -> fuzzy
+    ('mixamorig_Hips', 'Bone:Hips', 'Hips.001' style exports).
+    """
+    node_ci = {n.lower(): n for n in sk.names}
+    pairs: dict[str, tuple[int, int]] = {}
+    missing: list[str] = []
+    for soma_name, mix_name in SOMA_TO_MIXAMO.items():
+        tgt_name = resolve_target_name(mix_name, node_ci, prefix)
+        if tgt_name is None:
+            tgt_name = resolve_fuzzy(mix_name, sk.names)
+        if tgt_name is None:
+            missing.append(f"{soma_name} -> {mix_name}")
+            continue
+        pairs[soma_name] = (SOMA77_INDEX[soma_name], sk.node_index[tgt_name])
+    return pairs, missing
+
+
 def retarget(
     global_rot_src: np.ndarray,  # (T, 77, 3, 3)
     posed_joints_src: np.ndarray,  # (T, 77, 3) meters
@@ -131,14 +151,19 @@ def retarget(
 ) -> RetargetResult:
     """Run the full retarget pipeline."""
     # ---- build the source->target joint correspondences -----------------------------
-    pairs: dict[str, tuple[int, int]] = {}  # soma name -> (src idx, tgt node idx)
+    pairs, missing = build_pairs(sk, prefix)
+    if "Hips" not in pairs:
+        sample = ", ".join(sk.names[:12])
+        raise ValueError(
+            "could not find the pelvis bone in this character — "
+            "'Hips' did not resolve to any node. This is usually not a Mixamo-named rig. "
+            f"Expected e.g. 'mixamorig:Hips' or 'Hips' (also accepting 'mixamorig_Hips', "
+            f"'Hips.001' style). First nodes of this file: [{sample}]"
+        )
+    if missing:
+        # expected: finger tails / neck2 / eyes etc. — report header keeps the real misses
+        pass
     node_ci = {n.lower(): n for n in sk.names}
-    for soma_name, mix_name in SOMA_TO_MIXAMO.items():
-        tgt_name = resolve_target_name(mix_name, node_ci, prefix)
-        if tgt_name is None:
-            continue
-        pairs[soma_name] = (SOMA77_INDEX[soma_name], sk.node_index[tgt_name])
-
     src_of_tgt = {}
     for soma_name, (src_i, tgt_i) in pairs.items():
         src_of_tgt[tgt_i] = src_i
@@ -190,8 +215,8 @@ def retarget(
     # ---- pass 2: limb length swing fix ----------------------------------------------
     if limb_fix:
         for joint_name, child_name in LIMB_CHAINS:
-            tgt_name = resolve_target_name(joint_name, node_ci, prefix)
-            child = resolve_target_name(child_name, node_ci, prefix)
+            tgt_name = resolve_target_name(joint_name, node_ci, prefix) or resolve_fuzzy(joint_name, sk.names)
+            child = resolve_target_name(child_name, node_ci, prefix) or resolve_fuzzy(child_name, sk.names)
             if tgt_name is None or child is None or tgt_name not in src_of_tgt:
                 continue
             j_i = sk.node_index[tgt_name]

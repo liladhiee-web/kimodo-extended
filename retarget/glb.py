@@ -33,14 +33,10 @@ def load_gltf(path: str) -> GLTF2:
 
 
 def detect_prefix(gltf: GLTF2) -> str:
-    """Guess the bone-name prefix. Mixamo exports use 'mixamorig:'."""
-    for node in gltf.nodes:
-        if node.name and ":" in node.name and len(node.name.split(":", 1)[0]) <= 12:
-            # assume smth like mixamorig:Hips — verify against a known mixamorig name
-            pre, base = node.name.split(":", 1)
-            if base.lower().startswith(("hips", "spine", "head")):
-                return pre + ":"
-    return ""
+    """Guess the bone-name prefix. Handles 'mixamorig:Hips' AND 'mixamorig_Hips' exports."""
+    from mapping import detect_prefix as _detect
+
+    return _detect([n.name for n in gltf.nodes if n.name])
 
 
 def build_target_skeleton(gltf: GLTF2) -> tuple[TargetSkeleton, list[str]]:
@@ -68,7 +64,10 @@ def build_target_skeleton(gltf: GLTF2) -> tuple[TargetSkeleton, list[str]]:
 
     n = len(gltf.nodes)
     names = [gltf.nodes[i].name or f"node_{i}" for i in order]
-    parent_i = np.array([node_parent[i] for i in order], dtype=np.int64)
+    pos_of = {node: k for k, node in enumerate(order)}
+    # parent indices are stored in TOPOLOGICAL-order space (parents always come first),
+    # not raw glTF node-index space — user GLBs can declare nodes in any order
+    parent_i = np.array([-1 if node_parent[i] == -1 else pos_of[node_parent[i]] for i in order], dtype=np.int64)
 
     bind_local_t = np.zeros((n, 3))
     bind_local_r = np.tile(np.eye(3), (n, 1, 1))
@@ -81,16 +80,28 @@ def build_target_skeleton(gltf: GLTF2) -> tuple[TargetSkeleton, list[str]]:
         bind_local_t[k] = t
         bind_local_r[k] = quat_to_mat(q)
 
+    # FBX exports often put a compensating scale on a wrapper node (e.g. FBX_Root
+    # with 0.01 while raw translations are centimeters). Fold inherited uniform
+    # scale into the world positions so heights/lengths come out in real meters,
+    # no matter whether the exporter baked the scale or delegated it.
     bind_global_r = np.tile(np.eye(3), (n, 1, 1))
     bind_global_p = np.zeros((n, 3))
+    acc_scale = np.ones(n)
     for k in range(n):
         p = parent_i[k]
+        p_acc = 1.0 if p == -1 else acc_scale[p]
+        local_scale = 1.0
+        gl_node = gltf.nodes[order[k]]
+        _, _q, s = _node_trs(gl_node)
+        if s is not None:
+            local_scale = float(np.mean(s))
+        acc_scale[k] = p_acc * local_scale
         if p == -1:
             bind_global_r[k] = bind_local_r[k]
             bind_global_p[k] = bind_local_t[k]
         else:
             bind_global_r[k] = bind_global_r[p] @ bind_local_r[k]
-            bind_global_p[k] = bind_global_p[p] + bind_global_r[p] @ bind_local_t[k]
+            bind_global_p[k] = bind_global_p[p] + bind_global_r[p] @ (bind_local_t[k] * p_acc)
 
     node_index = {name: k for k, name in enumerate(names)}
     sk = TargetSkeleton(

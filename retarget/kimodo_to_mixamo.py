@@ -16,7 +16,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from glb import add_animation, build_target_skeleton, detect_prefix, load_gltf, save_gltf  # noqa: E402
-from mapping import SOMA_TO_MIXAMO, resolve_target_name  # noqa: E402
+from mapping import SOMA_TO_MIXAMO  # noqa: E402
 from retarget import retarget  # noqa: E402
 
 
@@ -85,18 +85,15 @@ def main():
     sk, warns = build_target_skeleton(gltf)
     prefix = detect_prefix(gltf)
 
-    mapped, missing_tgt = [], []
-    for soma_name, mix_name in SOMA_TO_MIXAMO.items():
-        if resolve_target_name(mix_name, {n.lower(): n for n in sk.names}, prefix):
-            mapped.append(soma_name)
-        else:
-            missing_tgt.append(f"{soma_name} -> {prefix}{mix_name}")
+    from retarget import build_pairs
+
+    pairs, missing = build_pairs(sk, prefix)
 
     if args.check:
         print(f"prefix: '{prefix}'")
-        print(f"nodes: {len(sk.names)}, mapped joints: {len(mapped)}/77")
+        print(f"nodes: {len(sk.names)}, mapped joints: {len(pairs)}/{len(SOMA_TO_MIXAMO)}")
         print("unmapped target bones (no Mixamo counterpart in file):")
-        for m in missing_tgt:
+        for m in missing:
             print("  -", m)
         return
 
