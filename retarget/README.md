@@ -48,8 +48,30 @@ python retarget/run_selftest.py
 Options: `--no-limb-fix`, `--no-sticky-feet`, `--clip-prefix myname_`.
 
 Input motions: Kimodo NPZ from `kimodo_gen` on any **SOMA-77** model
-(`posed_joints`, `global_rot_mats`, `foot_contacts`). For SMPL-X/G1 formats convert first
+(`posed_joints`, `global_rot_mats`, `foot_contacts`), **or a Kimodo SOMA-77 `.bvh`**
+(demo export — has no foot contacts, so sticky feet is auto-disabled; numpy-only parser,
+`retarget/soma_bvh.py`, rotation convention verified against Kimodo's own
+`scipy from_euler("ZYX")` loader). For SMPL-X/G1 formats convert first
 with Kimodo's own `kimodo_convert`.
+
+## Web app (upload + 3D preview, no CLI)
+
+`retarget/webapp.py` is a small **CPU-only** FastAPI app — no torch — for Kaggle or any host:
+
+```bash
+pip install fastapi uvicorn python-multipart numpy pygltflib
+python retarget/webapp.py          # serves http://localhost:8000
+```
+
+Open `/`, upload your character `.glb` and a motion `.npz`/`.bvh`, press **Retarget**,
+preview the baked animation in the built-in Three.js viewport (play/pause/speed),
+then **Download GLB** — the downloaded file IS the result (character + clip).
+
+Endpoints: `POST /api/character`, `POST /api/motion`, `POST /api/retarget` (async job),
+`GET /api/job/<id>`, `GET /download/<job_id>`, `GET /api/health`.
+
+Kaggle notebook: `kaggle_retarget_web.ipynb` (CPU accelerator; clones the repo, installs
+(~1 min), starts the app, exposes it through a Cloudflare quick-tunnel).
 
 ## Three.js integration
 

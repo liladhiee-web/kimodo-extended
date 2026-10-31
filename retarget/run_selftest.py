@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from glb import add_animation, build_target_skeleton, detect_prefix, load_gltf, save_gltf  # noqa: E402
 from retarget import derive_locals, fk_target_local_to_global, retarget  # noqa: E402
 from quatmath import quat_to_mat  # noqa: E402
-from soma import SOMA77_INDEX, SOMA77_PARENT, parse_bvh_rest  # noqa: E402
+from soma import SOMA77_INDEX, SOMA77_NAMES, SOMA77_PARENT, parse_bvh_rest  # noqa: E402
+from soma_bvh import parse_bvh_to_kimodo_rows, rot_axis  # noqa: E402
 
 from pygltflib import GLTF2, Node, Scene  # noqa: E402
 
@@ -254,6 +255,123 @@ def make_synthetic_mixamo_glb(tmp_dir: Path) -> Path:
     return out
 
 
+def _local_euler_zyx_deg(R) -> np.ndarray:
+    """Recover (z, y, x) euler degrees such that Rz@Ry@Rx == R.
+
+    Supports exactly what the synthetic generator produces: identity,
+    single-axis X rotation, single-axis Z rotation.
+    """
+    I = np.eye(3)
+    if np.abs(R - I).max() < 1e-12:
+        return np.zeros(3)
+    if abs(R[0, 0] - 1.0) < 1e-9:  # pure X rotation: first row/col identity, R[2,2]=cos(a)
+        return np.array([0.0, 0.0, float(np.degrees(np.arctan2(R[2, 1], R[1, 1])))])
+    if abs(R[2, 2] - 1.0) < 1e-9:  # pure Z rotation: last row/col identity
+        return np.array([float(np.degrees(np.arctan2(R[1, 0], R[0, 0]))), 0.0, 0.0])
+    raise ValueError("synthetic BVH writer only supports single-axis rotations")
+
+
+def write_soma_bvh(out_path: Path, offsets: dict, g_rot: np.ndarray, g_pos: np.ndarray, fps: float) -> None:
+    """Write a Kimodo-layout SOMA-77 BVH: Root wrapper carries nothing; Hips carries
+    root translation — matching kimodo/exports/bvh.py:motion_to_bvh keyframe layout."""
+    children: dict[str | None, list[str]] = {}
+    for name in SOMA77_NAMES:
+        children.setdefault(SOMA77_PARENT[name], []).append(name)
+
+    hips_offset = offsets["Hips"].copy()  # meters, e.g. (0, 1, 0)
+
+    ordered: list[str | None] = [None]  # None == Root wrapper
+    lines = [
+        "HIERARCHY",
+        "ROOT Root",
+        "{",
+        "  OFFSET 0.0 0.0 0.0",
+        "  CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation",
+    ]
+
+    def emit(name: str, depth: int) -> None:
+        ind = "  " * depth
+        off = offsets[name] * 100.0  # cm like the Kimodo template
+        lines.append(f"{ind}JOINT {name}")
+        lines.append(f"{ind}{{")
+        lines.append(f"{ind}  OFFSET {off[0]:.6f} {off[1]:.6f} {off[2]:.6f}")
+        if name == "Hips":
+            lines.append(f"{ind}  CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation")
+        else:
+            lines.append(f"{ind}  CHANNELS 3 Zrotation Yrotation Xrotation")
+        ordered.append(name)
+        for c in children.get(name, []):
+            emit(c, depth + 1)
+        lines.append(f"{ind}}}")
+
+    emit("Hips", 1)
+    lines.append("}")
+
+    T = g_pos.shape[0]
+    lines.append("MOTION")
+    lines.append(f"Frames: {T}")
+    lines.append(f"Frame Time: {1.0 / fps:.8f}")
+    for t in range(T):
+        vals: list[float] = [0.0] * 6  # Root wrapper: zero translation + identity rotation
+        # Hips: translation channels carry the root motion in cm (Root is identity)
+        rel = (g_pos[t, 0] - hips_offset) * 100.0
+        vals += [float(rel[0]), float(rel[1]), float(rel[2])]
+        vals += [float(v) for v in _local_euler_zyx_deg(g_rot[t, 0])]
+        for name in ordered[1:]:
+            if name == "Hips":
+                continue
+            j = SOMA77_INDEX[name]
+            p_name = SOMA77_PARENT[name]
+            pi = SOMA77_INDEX[p_name] if p_name is not None else None
+            # local rotation R_local = R_parent^-1 @ R_joint
+            R_local = g_rot[t, j].copy() if pi is None else g_rot[t, pi].T @ g_rot[t, j]
+            vals += [float(v) for v in _local_euler_zyx_deg(R_local)]
+        lines.append(" ".join(f"{v:.8f}" for v in vals))
+    from pathlib import Path
+
+    Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_bvh_roundtrip(repo_root: Path, td: Path) -> None:
+    """BVH parser must reproduce the synthetic SOMA-77 motion exactly."""
+    bvh_template = repo_root / "kimodo" / "assets" / "skeletons" / "somaskel77" / "somaskel77_standard_tpose.bvh"
+
+    # cross-check the euler convention against Kimodo's own loader (scipy intrinsic)
+    try:
+        from scipy.spatial.transform import Rotation as _R
+
+        from soma_bvh import _rotation_from_channels
+
+        rng = np.random.default_rng(0)
+        for a in rng.uniform(-0.5, 0.5, size=(8, 3)):
+            mine = _rotation_from_channels(["Zrotation", "Yrotation", "Xrotation"], a)
+            theirs = _R.from_euler("ZYX", a).as_matrix()
+            assert np.abs(mine - theirs).max() < 1e-12, "euler convention != scipy from_euler('ZYX')"
+        print("  BVH euler convention == Kimodo's scipy from_euler('ZYX') [verified]")
+    except ImportError:
+        print("  scipy not installed locally; skipped euler-conv cross-check")
+
+    T, fps = 30, 30.0
+    g_rot_src, g_pos_src, _contacts = make_synthetic_soma_motion(str(bvh_template), T=T, fps=fps)
+    offsets = parse_bvh_rest(str(bvh_template))
+    out_path = Path(td) / "synthetic_motion.bvh"
+    write_soma_bvh(out_path, offsets, g_rot_src, g_pos_src, fps)
+
+    data = parse_bvh_to_kimodo_rows(str(out_path), SOMA77_INDEX, SOMA77_NAMES)
+    assert abs(data["fps"] - fps) < 1e-6, f"fps wrong: {data['fps']}"
+    err_p = float(np.abs(data["posed_joints"] - g_pos_src).max())
+    err_r = float(np.abs(data["global_rot_mats"] - g_rot_src).max())
+    assert err_p < 1e-7, f"BVH FK positions mismatch: {err_p:.2e}"
+    assert err_r < 1e-7, f"BVH FK rotations mismatch: {err_r:.2e}"
+    assert data["foot_contacts"] is None
+
+    g_rot_b, g_pos_b, contacts_b = make_synthetic_soma_motion(str(out_path), T=T, fps=fps)
+    err_2 = float(np.abs(g_pos_b - g_pos_src).max())
+    assert err_2 < 1e-7, f"second pass FK mismatch: {err_2:.2e}"
+
+    print("  BVH round-trip: FK positions err", f"{err_p:.2e}", "rotations err", f"{err_r:.2e}", "OK")
+
+
 def main():
     repo_root = Path(__file__).resolve().parent.parent
     bvh = repo_root / "kimodo" / "assets" / "skeletons" / "somaskel77" / "somaskel77_standard_tpose.bvh"
@@ -263,6 +381,7 @@ def main():
     g_rot_src, g_pos_src, contacts = make_synthetic_soma_motion(str(bvh), T=T, fps=fps)
 
     with tempfile.TemporaryDirectory() as td:
+        test_bvh_roundtrip(repo_root, Path(td))
         char_path = make_synthetic_mixamo_glb(td)
 
         gltf = load_gltf(str(char_path))
